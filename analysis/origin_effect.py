@@ -47,6 +47,13 @@ def load() -> pd.DataFrame:
     df["셀평균"] = df["셀"].map(cell_wavg)
     df["셀산지수"] = df["셀"].map(g["지역"].nunique())
     df["rel"] = np.log(df["경락가"] / df["셀평균"])
+    # 강건성: 과수크기(50/100개 등 숫자)까지 셀에 포함 — '50/적특상' 같은 선별 표기 효과 통제
+    size = df["과수크기"].fillna("").str.extract(r"(\d{2,3})")[0].fillna("NA")
+    df["셀2"] = df["셀"] + "|" + size
+    g2 = df.groupby("셀2")
+    df["셀2산지수"] = df["셀2"].map(g2["지역"].nunique())
+    df["rel2"] = np.log(df["경락가"] / df["셀2"].map(
+        g2.apply(lambda x: np.average(x["경락가"], weights=x["수량"]), include_groups=False)))
     return df
 
 
@@ -73,12 +80,12 @@ def origin_table(df: pd.DataFrame, season: str, top: int = 12) -> pd.DataFrame:
     return t.head(top).round(1)
 
 
-def test_premium(df: pd.DataFrame) -> pd.DataFrame:
+def test_premium(df: pd.DataFrame, rel: str = "rel", n_col: str = "셀산지수") -> pd.DataFrame:
     """A. 셀 내 주산지 프리미엄 (산지 2곳 이상 경합한 셀만). 수량 가중 WLS, 날짜 클러스터 SE."""
     rows = []
-    d0 = df[df["셀산지수"] >= 2]
+    d0 = df[df[n_col] >= 2]
     for key, d in [("전체", d0)] + list(d0.groupby("시즌")):
-        m = smf.wls("rel ~ 주산지", data=d, weights=d["수량"]).fit(
+        m = smf.wls(f"{rel} ~ 주산지", data=d, weights=d["수량"]).fit(
             cov_type="cluster", cov_kwds={"groups": d["날짜"].dt.strftime("%Y%m%d").astype("category").cat.codes})
         b, (lo, hi) = m.params["주산지"], m.conf_int().loc["주산지"]
         rows.append({"시즌": key, "주산지 프리미엄%": 100 * (np.exp(b) - 1),
@@ -143,9 +150,11 @@ def main() -> None:
         t.to_csv(OUT / f"origin_{s.replace('/', '-').replace(' ', '_')}.csv", encoding="utf-8-sig")
         print(f"### {s} 산지별 (주산지=누적물량 {int(MAIN_CUM*100)}%)\n" + md(t) + "\n")
     a, a2, b, c = test_premium(df), test_share_rank(df), test_pressure(df), region_table(df)
-    for name, t in [("A_premium", a), ("A2_share_rank", a2), ("B_pressure", b), ("C_gyeongnam", c)]:
+    a_sz = test_premium(df, "rel2", "셀2산지수")
+    for name, t in [("A_premium", a), ("A_premium_size_ctrl", a_sz), ("A2_share_rank", a2), ("B_pressure", b), ("C_gyeongnam", c)]:
         t.to_csv(OUT / f"{name}.csv", encoding="utf-8-sig")
     print("### A. 주산지 프리미엄 (같은 날·규격·등급 내)\n" + md(a, index=False) + "\n")
+    print("### A'. 주산지 프리미엄 — 과수크기까지 통제\n" + md(a_sz, index=False) + "\n")
     print("### A2. 산지 물량점유율 vs 상대가격 순위상관 (거래 30건 이상 산지)\n" + md(a2, index=False) + "\n")
     print("### B. 주산지 물량 압박 (일별)\n" + md(b, index=False) + "\n")
     print("### C. 경남 산지\n" + md(c) + "\n")
