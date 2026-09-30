@@ -6,6 +6,8 @@
     python hkck_price.py 20260929        # 특정 날짜
     python hkck_price.py --source api    # aT OpenAPI(data.go.kr 15141808) 사용
     python hkck_price.py --no-fallback   # 어제 폴백 끄기
+    python hkck_price.py --corp tgjungang          # 대구 중앙청과 (API 전용)
+    python hkck_price.py --corp tgjungang --corp-cd 22000101   # 코드 직접 지정
 
 실제 페이지 구조 (2026-09 확인):
     - 품목/품종/산지 드롭다운은 없음. 대신
@@ -122,19 +124,22 @@ def fetch_hkck(date: str, verbose: bool = True) -> pd.DataFrame:
 
 # ─────────────────────── 대안: aT 실시간 경매정보 OpenAPI ───────────────────────
 API_URL = "https://apis.data.go.kr/B552845/katRealTime2/trades2"
-GARAK_CD = "110001"      # 서울 가락도매시장
-HKCK_CORP_CD = "11000105"  # 가락 한국청과 (aT 법인코드, 표준코드 API 15141818로 재확인 권장)
+# aT 도매시장/법인 코드. 표준코드 API(data.go.kr 15141818)로 재확인 권장 → 틀리면 --market-cd/--corp-cd로 덮어쓰기.
+# 코드가 틀려도 결과가 0건이 되지 않도록, 법인코드 없이 시장 단위로 받은 뒤 법인명(corp_nm)으로도 거른다.
+CORPS = {
+    "hkck":      {"name": "한국청과",     "market_cd": "110001", "corp_cd": "11000105", "file": "hkck"},       # 서울 가락
+    "tgjungang": {"name": "대구중앙청과", "market_cd": "220001", "corp_cd": "22000101", "file": "tgjungang"},  # 대구 북부
+}
 
 
-def fetch_api(date: str, verbose: bool = True) -> pd.DataFrame:
+def fetch_api(date: str, verbose: bool = True, corp: dict = CORPS["hkck"]) -> pd.DataFrame:
     key = os.environ.get("DATA_GO_KR_KEY")
     if not key:
         sys.exit("환경변수 DATA_GO_KR_KEY가 없습니다 (data.go.kr 15141808 활용신청 후 발급).")
     ymd = f"{date[:4]}-{date[4:6]}-{date[6:]}"
     params = {"serviceKey": key, "returnType": "json", "numOfRows": 1000,
               "cond[trd_clcln_ymd::EQ]": ymd,
-              "cond[whsl_mrkt_cd::EQ]": GARAK_CD,
-              "cond[corp_cd::EQ]": HKCK_CORP_CD}
+              "cond[whsl_mrkt_cd::EQ]": corp["market_cd"]}
     s = make_session()
     items, page = [], 1
     while True:
@@ -148,8 +153,14 @@ def fetch_api(date: str, verbose: bool = True) -> pd.DataFrame:
             break
         page += 1
     if verbose:
-        print(f"[API] {ymd} 한국청과 전체 {len(items)}건")
+        print(f"[API] {ymd} 시장 {corp['market_cd']} 전체 {len(items)}건")
     raw = pd.DataFrame(items)
+    if not raw.empty:
+        nm = raw.get("corp_nm", pd.Series("", index=raw.index)).astype(str).str.replace(" ", "")
+        raw = raw[(raw.get("corp_cd", "").astype(str) == corp["corp_cd"])
+                  | nm.str.contains(corp["name"].replace(" ", ""))]
+        if verbose:
+            print(f"[API] {corp['name']} {len(raw)}건")
     if raw.empty:
         return pd.DataFrame(columns=["지역", "품목", "품종", "규격", "등급", "수량", "경락가"])
     # 품목코드는 소분류명/법인품종명으로 필터 (코드 체계 변경에 안전)
@@ -190,10 +201,22 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("date", nargs="?", default=datetime.now().strftime("%Y%m%d"), help="YYYYMMDD (기본: 오늘)")
     ap.add_argument("--source", choices=["web", "api"], default="web")
+    ap.add_argument("--corp", choices=list(CORPS), default="hkck", help="hkck=가락 한국청과, tgjungang=대구 중앙청과")
+    ap.add_argument("--market-cd", help="aT 도매시장코드 덮어쓰기")
+    ap.add_argument("--corp-cd", help="aT 법인코드 덮어쓰기")
     ap.add_argument("--no-fallback", action="store_true", help="데이터 없을 때 전날로 넘어가지 않음")
     args = ap.parse_args()
 
-    fetch = fetch_hkck if args.source == "web" else fetch_api
+    corp = dict(CORPS[args.corp])
+    if args.market_cd:
+        corp["market_cd"] = args.market_cd
+    if args.corp_cd:
+        corp["corp_cd"] = args.corp_cd
+    if args.corp != "hkck" and args.source == "web":
+        # 대구중앙청과 홈페이지는 자동접속방지(JS 쿠키 챌린지)가 있어 스크래핑하지 않고 API로 조회
+        print(f"[안내] {corp['name']}는 웹 스크래핑 미지원 → aT OpenAPI로 조회")
+        args.source = "api"
+    fetch = fetch_hkck if args.source == "web" else (lambda d: fetch_api(d, corp=corp))
     date = args.date
     try:
         df = fetch(date)
@@ -203,7 +226,7 @@ def main() -> None:
             df = fetch(date)
     except (requests.RequestException, ValueError, KeyError) as e:
         if args.source == "web":
-            sys.exit(f"[실패] 한국청과 사이트 접속/파싱 실패: {e}\n"
+            sys.exit(f"[실패] {corp['name']} 사이트 접속/파싱 실패: {e}\n"
                      "  대안: DATA_GO_KR_KEY 설정 후  python hkck_price.py --source api")
         raise
     if df.empty:
@@ -213,20 +236,26 @@ def main() -> None:
     if zero.any():
         print(f"[제외] 경락가 0원 {zero.sum()}건")
         df = df[~zero]
-    mask = df["규격"].str.contains(UNIT_PAT, case=False, regex=True) & (df["등급"] == GRADE)
+    mask = df["규격"].str.contains(UNIT_PAT, case=False, regex=True)
+    label = "10kg_특"
+    if (df["등급"] == "미제공").all():
+        print("[주의] API 응답에 등급 정보가 없어 '특' 필터를 적용하지 않음 (10kg 전체 등급 통계)")
+        label = "10kg_전등급"
+    else:
+        mask &= df["등급"] == GRADE
     sel = df[mask]
-    print(f"[필터] {date} 백다다기 {len(df)}건 → 10kg·특 {len(sel)}건")
+    print(f"[필터] {date} 백다다기 {len(df)}건 → {label} {len(sel)}건")
     if sel.empty:
         print("\n단위×등급 분포:")
         print(df.value_counts(["규격", "등급"]).to_string())
         sys.exit(0)
 
     result = summarize(sel)
-    print(f"\n### 한국청과 백다다기 10kg 특 — {date} ({args.source})\n")
+    print(f"\n### {corp['name']} 백다다기 {label.replace('_', ' ')} — {date} ({args.source})\n")
     print(result.to_markdown(index=False, floatfmt=",.0f", intfmt=","))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = OUT_DIR / f"hkck_백다다기_10kg_특_{date}.csv"
+    path = OUT_DIR / f"{corp['file']}_백다다기_{label}_{date}.csv"
     result.to_csv(path, index=False, encoding="utf-8-sig")
     print(f"\n저장: {path}")
 
