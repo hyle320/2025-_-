@@ -104,8 +104,24 @@ def test_pressure(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).round(3)
 
 
+def test_share_rank(df: pd.DataFrame, min_trades: int = 30) -> pd.DataFrame:
+    """A2. 산지 단위: 시즌 물량점유율이 클수록 상대가격이 높은가? (스피어만 순위상관)"""
+    from scipy.stats import spearmanr
+    rows = []
+    for s, d in df.groupby("시즌"):
+        t = d.groupby("지역").apply(lambda x: pd.Series({
+            "share": x["수량"].sum() / d["수량"].sum(), "n": len(x),
+            "rel": np.average(x["rel"], weights=x["수량"])}), include_groups=False)
+        t = t[t["n"] >= min_trades]
+        rho, p = spearmanr(t["share"], t["rel"])
+        rows.append({"시즌": s, "산지수": len(t), "순위상관 rho": rho, "p값": p})
+    return pd.DataFrame(rows).round(3)
+
+
 def region_table(df: pd.DataFrame, pattern: str = "경남") -> pd.DataFrame:
     d = df[df["지역"].str.contains(pattern)]
+    if d.empty:
+        return pd.DataFrame({"안내": [f"{pattern} 산지 거래 없음"]})
     return d.groupby(["시즌", "지역"]).apply(lambda x: pd.Series({
         "거래건수": len(x), "총수량": x["수량"].sum(), "반입일수": x["날짜"].nunique(),
         "상대가격%": 100 * (np.exp(np.average(x["rel"], weights=x["수량"])) - 1),
@@ -126,10 +142,11 @@ def main() -> None:
         t = origin_table(df, s)
         t.to_csv(OUT / f"origin_{s.replace('/', '-').replace(' ', '_')}.csv", encoding="utf-8-sig")
         print(f"### {s} 산지별 (주산지=누적물량 {int(MAIN_CUM*100)}%)\n" + md(t) + "\n")
-    a, b, c = test_premium(df), test_pressure(df), region_table(df)
-    for name, t in [("A_premium", a), ("B_pressure", b), ("C_gyeongnam", c)]:
+    a, a2, b, c = test_premium(df), test_share_rank(df), test_pressure(df), region_table(df)
+    for name, t in [("A_premium", a), ("A2_share_rank", a2), ("B_pressure", b), ("C_gyeongnam", c)]:
         t.to_csv(OUT / f"{name}.csv", encoding="utf-8-sig")
     print("### A. 주산지 프리미엄 (같은 날·규격·등급 내)\n" + md(a, index=False) + "\n")
+    print("### A2. 산지 물량점유율 vs 상대가격 순위상관 (거래 30건 이상 산지)\n" + md(a2, index=False) + "\n")
     print("### B. 주산지 물량 압박 (일별)\n" + md(b, index=False) + "\n")
     print("### C. 경남 산지\n" + md(c) + "\n")
 
