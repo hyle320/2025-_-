@@ -51,15 +51,19 @@ def season(d: pd.Timestamp) -> str | None:
 
 
 def load() -> pd.DataFrame:
-    frames = [pd.read_csv(f, dtype=str) for f in sorted(SRC.glob("*__*.csv"))]
+    frames = [pd.read_csv(f, dtype=str) for f in sorted(SRC.glob("*__*.csv")) if f.stat().st_size > 200]
     df = pd.concat(frames, ignore_index=True)
     for c in ("qty", "price", "price_min", "price_max", "price_avg"):
         df[c] = pd.to_numeric(df[c].str.replace(",", ""), errors="coerce")
     df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce")
     df["계절"] = df["date"].map(season)
+    unit = df["unit"].fillna("")
+    kg = pd.to_numeric(unit.str.extract(r"(\d+(?:\.\d+)?)\s*(?:kg|키로)", flags=re.I)[0], errors="coerce")
+    ok_unit = (kg == 10) & ~unit.str.contains(r"-P\b|비닐|망", case=False)   # 춘천 '10Kg-P' 등 이형 포장 제외
     grade = df["grade"].fillna("").str.strip()
-    df = df[df["unit"].fillna("").str.contains(UNIT_PAT) & grade.str.match(r"^특(\(|$|1|등)")
-            & df["계절"].notna()].copy()
+    df["등급구분"] = np.where(grade.eq("") | grade.isin(["-", "nan"]), "미구분", "특")
+    ok_grade = grade.str.match(r"^특(\(|$|1|등)") | (df["등급구분"] == "미구분")
+    df = df[ok_unit & ok_grade & df["계절"].notna()].copy()
     df["p"] = df["price"].where(df["granularity"] == "trade", df["price_avg"])
     return df[df["p"] > 0]
 
@@ -69,7 +73,7 @@ def daily(df: pd.DataFrame) -> pd.DataFrame:
         if (x["granularity"] == "trade").all() and x["qty"].notna().all():
             return pd.Series({"p": np.average(x["p"], weights=x["qty"]), "qty": x["qty"].sum()})
         return pd.Series({"p": x["p"].mean(), "qty": np.nan})
-    return df.groupby(["market", "corp", "계절", "date"]).apply(rep, include_groups=False).reset_index()
+    return df.groupby(["market", "corp", "등급구분", "계절", "date"]).apply(rep, include_groups=False).reset_index()
 
 
 def origin_stats(df: pd.DataFrame) -> pd.DataFrame:
@@ -96,11 +100,12 @@ def main() -> None:
     d = daily(df)
     bench = d[(d["market"] == BENCH[0]) & (d["corp"] == BENCH[1])].set_index("date")["p"]
     d["ratio"] = np.log(d["p"] / d["date"].map(bench))
-    s = d.groupby(["market", "corp", "계절"]).agg(
+    s = d.groupby(["market", "corp", "등급구분", "계절"]).agg(
         일수=("date", "nunique"), 일평균가=("p", "mean"), 중앙값=("p", "median"),
         한국청과대비=("ratio", "mean"), 변동성=("ratio", "std"), 일평균반입=("qty", "mean")).reset_index()
     s["한국청과대비%"] = 100 * (np.exp(s.pop("한국청과대비")) - 1)
     s["변동성%"] = 100 * s.pop("변동성")
+    s["신뢰"] = np.where(s["일수"] >= 8, "", "표본적음")
     s["거리km"] = s["market"].map(dist_of)
     s["추정순수취"] = s["일평균가"] * (1 - COMMISSION) - UNLOAD - (FREIGHT_BASE + FREIGHT_PER_KM * s["거리km"])
     o = origin_stats(df)
